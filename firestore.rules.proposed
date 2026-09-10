@@ -1,0 +1,55 @@
+rules_version = '2';
+
+// =============================================================================
+//  PROPOSED Firestore rules for Orbiet — FOR YOUR REVIEW BEFORE DEPLOYING.
+//
+//  This file adds rules ONLY for the new `siteStats` collection (the site-wide
+//  visitor counter). It does NOT change your existing courses/** rules — keep
+//  whatever you already have for those (currently `allow read: if true`).
+//
+//  Merge the siteStats block into your real firestore.rules, review it, then
+//  deploy. Do not deploy blindly.
+// =============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------------------
+    // EXISTING content tree — shown here for context only. Your live rules
+    // already allow public reads on courses/** (including exercisesAnswers).
+    // Reproduce your ACTUAL existing rules here; do not weaken them.
+    // -------------------------------------------------------------------------
+    match /courses/{document=**} {
+      allow read: if true;
+      allow write: if false; // learners never write course content
+    }
+
+    // -------------------------------------------------------------------------
+    // NEW: site-wide visitor counter (Spark-plan fallback, direct client write).
+    //
+    //   siteStats/visitorCount  ->  { count: number }
+    //
+    // Public READ (to display the number). WRITES are tightly restricted:
+    //   * the ONLY field that may change is `count`
+    //   * the new value must be EXACTLY old + 1 (no arbitrary values)
+    //   * no decrements, no jumps, no deletes, no creates via client
+    //
+    // This limits abuse to +1-per-request replay (best achievable without a
+    // Cloud Function). If you later move to Blaze + a Cloud Function, change
+    // this to `allow write: if false;` and let the function use the Admin SDK.
+    // -------------------------------------------------------------------------
+    match /siteStats/visitorCount {
+      allow read: if true;
+
+      allow update: if
+        // Only the `count` field is affected by this write.
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['count'])
+        // Must be a number and exactly previous + 1.
+        && request.resource.data.count is int
+        && request.resource.data.count == resource.data.count + 1;
+
+      // The document is created/seeded by you (console/admin), not by clients.
+      allow create, delete: if false;
+    }
+  }
+}
