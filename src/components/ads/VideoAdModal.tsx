@@ -1,46 +1,61 @@
 "use client";
 
 /**
- * Mandatory ~10-second video-ad gate shown BETWEEN lessons.
+ * Mandatory ~10-second video-ad gate shown BETWEEN lessons (every
+ * LESSONS_BETWEEN_VIDEO_ADS in-app "Next lesson" transitions — NOT on every
+ * transition, to avoid wrecking the reading/learning flow).
  *
- * ملاحظة (بالعربية): هذا هو إعلان الفيديو الإلزامي بين الدروس. لا نُشغّل سكربت
- * إعلان Adsterra الحقيقي في بيئة المعاينة؛ نعرض فقط عنصرًا نائبًا بحجم ثابت مع
- * عدّاد تنازلي هادئ. زر "تخطّي" قد يظهر بعد انتهاء العدّاد فقط، وقد لا يظهر
- * إطلاقًا حسب نوع وحدة إعلان الفيديو في Adsterra.
+ * REAL VIDEO AD (VAST) — how this works:
+ *   HilltopAds gives a "VAST Tag URL" (an XML ad-tag URL), not a ready-made
+ *   <script> snippet. A VAST tag is only useful if something knows how to
+ *   request it and render the resulting video creative inside a real
+ *   <video> element — that "something" is Google's IMA SDK, the free,
+ *   industry-standard VAST player used across the web. We load it lazily
+ *   (only when this modal actually opens, not on every page) and hand it
+ *   the VAST tag URL from NEXT_PUBLIC_HILLTOP_VAST_TAG_URL.
  *
- * ENGLISH: Placeholder for an Adsterra video ad unit. No real script runs in
- * preview. The overlay shows a calm, non-flashing countdown; the Skip button
- * appears only AFTER the countdown finishes — and depending on which Adsterra
- * video product is used, a Skip option may not be available at all.
+ * FALLBACK — why it exists and how it triggers:
+ *   VAST/IMA can fail silently for many reasons outside our control: ad
+ *   blockers (very common — IMA's own script is a frequent blocklist
+ *   target), no fill for the user's GEO, network issues, etc. Rather than
+ *   showing a broken/empty box, we race the real ad against a short timer.
+ *   If the IMA ad hasn't started by AD_FALLBACK_TIMEOUT_MS, OR IMA reports
+ *   an AdError, we tear down the IMA attempt and fall back to the plain
+ *   Adsterra banner unit that was already working reliably
+ *   (NEXT_PUBLIC_ADSTERRA_KEY_VIDEO, same as before this change).
  *
- * FREQUENCY: This does not show on every navigation. It shows once every
- * LESSONS_BETWEEN_VIDEO_ADS in-app "Next lesson" transitions, tracked via a
- * sessionStorage counter. It must NEVER appear on first site visit or when a
- * lesson is opened directly (external link / refresh) — only on in-app
- * next-lesson navigation. See LessonNav for how the trigger is wired.
+ * The mandatory countdown (Skip disabled until it hits 0) is enforced by
+ * US regardless of which path renders, so the guaranteed minimum exposure
+ * time is identical whether the visitor got the real video or the banner
+ * fallback.
+ *
+ * MOBILE: the ad box keeps a fixed 16:9 aspect ratio at 100% width (same
+ * pattern as before), and a ResizeObserver calls adsManager.resize(...) so
+ * IMA repaints correctly on orientation change / viewport resize — IMA does
+ * NOT do this automatically.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Ltr } from "@/components/Bidi";
 import AdsterraSlot from "./AdsterraSlot";
 
 // Adjust ad frequency here (show the video every Nth lesson transition).
+// Kept at 3 on purpose: showing this between every single lesson would wreck
+// the reading flow, so it only fires every 2-3 lesson transitions.
 export const LESSONS_BETWEEN_VIDEO_ADS = 3;
 
 const COUNTDOWN_SECONDS = 10;
 const TRANSITION_KEY = "orbiet_lesson_transitions";
 
-/**
- * Adsterra does not expose a self-hosted "video player with a custom
- * countdown" API for third-party sites — their video product is delivered as
- * its own ad unit (banner/native "video" creative), not a controllable
- * <video> element. So the mandatory watch-time is enforced HERE (by us, via
- * the countdown below) while the creative itself comes from a real Adsterra
- * unit rendered inside the reserved 16:9 box.
- *
- * Set this once you create a "Video"/native ad unit in the Adsterra
- * dashboard for this placement.
- */
-const VIDEO_AD_KEY = process.env.NEXT_PUBLIC_ADSTERRA_KEY_VIDEO;
+// How long we give the real VAST ad to actually start before giving up on it
+// and showing the Adsterra banner fallback instead.
+const AD_FALLBACK_TIMEOUT_MS = 6000;
+
+// The HilltopAds VAST tag URL (from: Websites -> your zone -> copy VAST tag).
+const VAST_TAG_URL = process.env.NEXT_PUBLIC_HILLTOP_VAST_TAG_URL;
+
+// Adsterra fallback banner key (unchanged from the previous version of this
+// file — this is what renders if the real video ad doesn't come through).
+const FALLBACK_AD_KEY = process.env.NEXT_PUBLIC_ADSTERRA_KEY_VIDEO;
 
 /**
  * Decide whether the video ad should show for THIS in-app next transition, and
@@ -55,6 +70,46 @@ export function shouldShowVideoAd(): boolean {
   return next % LESSONS_BETWEEN_VIDEO_ADS === 0;
 }
 
+// ---------------------------------------------------------------------------
+// Lazy IMA SDK script loader (module-level singleton promise so we only ever
+// inject the <script> tag once, no matter how many times the modal opens).
+// ---------------------------------------------------------------------------
+let imaSdkPromise: Promise<void> | null = null;
+
+function loadImaSdk(): Promise<void> {
+  if (typeof window === "undefined") {
+    return Promise.reject(new Error("no window"));
+  }
+  // Already loaded in a previous open.
+  if (window.google?.ima) return Promise.resolve();
+
+  if (!imaSdkPromise) {
+    imaSdkPromise = new Promise((resolve, reject) => {
+      const existing = document.querySelector<HTMLScriptElement>(
+        'script[data-ima-sdk="true"]'
+      );
+      if (existing) {
+        existing.addEventListener("load", () => resolve());
+        existing.addEventListener("error", () =>
+          reject(new Error("IMA SDK failed to load"))
+        );
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = "https://imasdk.googleapis.com/js/sdkloader/ima3.js";
+      script.async = true;
+      script.dataset.imaSdk = "true";
+      script.onload = () => resolve();
+      // Common cause: ad blockers block this exact script by name/path.
+      script.onerror = () => reject(new Error("IMA SDK failed to load"));
+      document.head.appendChild(script);
+    });
+  }
+  return imaSdkPromise;
+}
+
+type AdState = "loading" | "playing-real-ad" | "fallback-banner";
+
 export default function VideoAdModal({
   open,
   onComplete,
@@ -64,7 +119,17 @@ export default function VideoAdModal({
   onComplete: () => void;
 }) {
   const [remaining, setRemaining] = useState(COUNTDOWN_SECONDS);
+  const [adState, setAdState] = useState<AdState>("loading");
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const boxRef = useRef<HTMLDivElement>(null); // 16:9 outer box (for sizing)
+  const adContainerRef = useRef<HTMLDivElement>(null); // IMA overlay div
+  const videoRef = useRef<HTMLVideoElement>(null); // content <video> (empty, ad-only)
+
+  const adsLoaderRef = useRef<any>(null);
+  const adsManagerRef = useRef<any>(null);
+  const fallbackFiredRef = useRef(false);
 
   const finish = useCallback(() => {
     if (timerRef.current) clearInterval(timerRef.current);
@@ -72,6 +137,27 @@ export default function VideoAdModal({
     onComplete();
   }, [onComplete]);
 
+  // Switch to the plain Adsterra banner fallback. Safe to call more than
+  // once (e.g. both a late AD_ERROR and the timeout firing) — only acts the
+  // first time.
+  const goToFallback = useCallback(() => {
+    if (fallbackFiredRef.current) return;
+    fallbackFiredRef.current = true;
+
+    if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current);
+    fallbackTimerRef.current = null;
+
+    try {
+      adsManagerRef.current?.destroy();
+    } catch {
+      // ignore — already torn down or never fully initialized
+    }
+    adsManagerRef.current = null;
+
+    setAdState("fallback-banner");
+  }, []);
+
+  // ---- Countdown (runs identically for real ad or fallback banner) ----
   useEffect(() => {
     if (!open) return;
     setRemaining(COUNTDOWN_SECONDS);
@@ -92,6 +178,146 @@ export default function VideoAdModal({
     };
   }, [open]);
 
+  // ---- IMA / VAST setup (runs once per modal open) ----
+  useEffect(() => {
+    if (!open) return;
+
+    // No VAST tag configured at all — skip straight to the fallback banner,
+    // no point trying to load the SDK.
+    if (!VAST_TAG_URL) {
+      setAdState("fallback-banner");
+      return;
+    }
+
+    let cancelled = false;
+    fallbackFiredRef.current = false;
+    setAdState("loading");
+
+    // Give the real ad AD_FALLBACK_TIMEOUT_MS to prove it's actually going
+    // to play. If nothing happens in time, bail to the banner.
+    fallbackTimerRef.current = setTimeout(() => {
+      goToFallback();
+    }, AD_FALLBACK_TIMEOUT_MS);
+
+    loadImaSdk()
+      .then(() => {
+        if (cancelled) return;
+        const ima = window.google?.ima;
+        if (!ima || !videoRef.current || !adContainerRef.current) {
+          goToFallback();
+          return;
+        }
+
+        const adDisplayContainer = new ima.AdDisplayContainer(
+          adContainerRef.current,
+          videoRef.current
+        );
+        const adsLoader = new ima.AdsLoader(adDisplayContainer);
+        adsLoaderRef.current = adsLoader;
+
+        adsLoader.addEventListener(
+          ima.AdsManagerLoadedEvent.Type.ADS_MANAGER_LOADED,
+          (e: any) => {
+            if (cancelled) return;
+            const adsManager = e.getAdsManager(videoRef.current);
+            adsManagerRef.current = adsManager;
+
+            adsManager.addEventListener(ima.AdEvent.Type.LOADED, () => {
+              // Real ad confirmed — cancel the fallback timer.
+              if (fallbackTimerRef.current) {
+                clearTimeout(fallbackTimerRef.current);
+                fallbackTimerRef.current = null;
+              }
+              if (!fallbackFiredRef.current) setAdState("playing-real-ad");
+            });
+            adsManager.addEventListener(
+              ima.AdErrorEvent.Type.AD_ERROR,
+              goToFallback
+            );
+            adsManager.addEventListener(
+              ima.AdEvent.Type.ALL_ADS_COMPLETED,
+              () => {
+                // Real ad played fully — respect the countdown gate as usual
+                // (handled by the render below / Skip button), nothing else
+                // to do here.
+              }
+            );
+
+            try {
+              const rect = boxRef.current?.getBoundingClientRect();
+              const w = Math.round(rect?.width ?? 480);
+              const h = Math.round(rect?.height ?? (w * 9) / 16);
+              adsManager.init(w, h, ima.ViewMode.NORMAL);
+              adsManager.start();
+            } catch {
+              goToFallback();
+            }
+          }
+        );
+
+        adsLoader.addEventListener(ima.AdErrorEvent.Type.AD_ERROR, goToFallback);
+
+        adDisplayContainer.initialize();
+
+        const adsRequest = new ima.AdsRequest();
+        adsRequest.adTagUrl = VAST_TAG_URL;
+        const rect = boxRef.current?.getBoundingClientRect();
+        adsRequest.linearAdSlotWidth = Math.round(rect?.width ?? 480);
+        adsRequest.linearAdSlotHeight = Math.round(
+          rect?.height ?? ((rect?.width ?? 480) * 9) / 16
+        );
+
+        adsLoader.requestAds(adsRequest);
+      })
+      .catch(() => {
+        // IMA SDK itself failed to load (very often an ad blocker) —
+        // straight to fallback, don't wait for the timer.
+        if (!cancelled) goToFallback();
+      });
+
+    return () => {
+      cancelled = true;
+      if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current);
+      fallbackTimerRef.current = null;
+      try {
+        adsManagerRef.current?.destroy();
+      } catch {
+        // ignore
+      }
+      adsManagerRef.current = null;
+      try {
+        adsLoaderRef.current?.destroy();
+      } catch {
+        // ignore
+      }
+      adsLoaderRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, goToFallback]);
+
+  // ---- Resize handling for mobile orientation change / responsive width ----
+  useEffect(() => {
+    if (!open || adState !== "playing-real-ad") return;
+    const ima = window.google?.ima;
+    if (!ima || !boxRef.current) return;
+
+    const observer = new ResizeObserver(() => {
+      const rect = boxRef.current?.getBoundingClientRect();
+      if (!rect || !adsManagerRef.current) return;
+      try {
+        adsManagerRef.current.resize(
+          Math.round(rect.width),
+          Math.round(rect.height),
+          ima.ViewMode.NORMAL
+        );
+      } catch {
+        // ignore — ad may have already ended
+      }
+    });
+    observer.observe(boxRef.current);
+    return () => observer.disconnect();
+  }, [open, adState]);
+
   if (!open) return null;
 
   const countdownDone = remaining === 0;
@@ -104,28 +330,62 @@ export default function VideoAdModal({
       aria-label="استراحة إعلانية قصيرة"
     >
       <div className="card w-full max-w-2xl p-6 text-center shadow-orbit">
-        {/* Mixed Arabic + emoji heading, rendered per the bidi rules. */}
         <h2 className="mb-4 text-xl font-bold text-space-ink">
           استراحة قصيرة قبل الدرس التالي <span aria-hidden="true">🚀</span>
         </h2>
 
-        {/* Fixed-size reserved video placeholder (16:9) to avoid layout shift. */}
-        <div className="relative mx-auto mb-5 w-full max-w-xl overflow-hidden rounded-xl border border-orbit-blue/25 bg-space-navy-800">
+        {/* Fixed-size reserved 16:9 box — same box hosts either the real IMA
+            ad or the Adsterra fallback banner, so layout never shifts. */}
+        <div
+          ref={boxRef}
+          className="relative mx-auto mb-5 w-full max-w-xl overflow-hidden rounded-xl border border-orbit-blue/25 bg-space-navy-800"
+        >
           <div style={{ paddingTop: "56.25%" }} />
-          {VIDEO_AD_KEY ? (
+
+          {/*
+           * Real video ad target — a SINGLE persistent <video> + overlay div
+           * that stays mounted for the whole lifetime of the modal (IMA
+           * attaches to it once via adDisplayContainer.initialize() and
+           * expects it to keep existing). We only ever toggle its opacity,
+           * never mount/unmount it, so the refs are never shared or
+           * reattached elsewhere.
+           */}
+          <div
+            className="absolute inset-0"
+            style={{ opacity: adState === "playing-real-ad" ? 1 : 0 }}
+          >
+            <video
+              ref={videoRef}
+              className="h-full w-full"
+              playsInline
+              muted={false}
+            />
+            <div ref={adContainerRef} className="absolute inset-0" />
+          </div>
+
+          {/* Fallback: the same Adsterra banner unit used before this change. */}
+          {adState === "fallback-banner" && (
             <div className="absolute inset-0 flex items-center justify-center">
-              <AdsterraSlot adKey={VIDEO_AD_KEY} width={480} height={270} />
+              {FALLBACK_AD_KEY ? (
+                <AdsterraSlot adKey={FALLBACK_AD_KEY} width={480} height={270} />
+              ) : (
+                <div className="flex flex-col items-center justify-center gap-2 text-space-muted">
+                  <span className="text-sm" dir="ltr">
+                    Set NEXT_PUBLIC_ADSTERRA_KEY_VIDEO
+                  </span>
+                </div>
+              )}
             </div>
-          ) : (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-space-muted">
-              <span className="text-sm" dir="ltr">
-                Set NEXT_PUBLIC_ADSTERRA_KEY_VIDEO
-              </span>
+          )}
+
+          {/* Still waiting to know whether the real ad will start. */}
+          {adState === "loading" && (
+            <div className="absolute inset-0 flex items-center justify-center text-space-muted">
+              <span className="text-sm">جارٍ تجهيز الإعلان…</span>
             </div>
           )}
         </div>
 
-        {/* Calm, non-flashing countdown. */}
         <p className="mb-4 text-space-muted">
           {countdownDone ? (
             "يمكنك المتابعة الآن"
@@ -137,12 +397,6 @@ export default function VideoAdModal({
           )}
         </p>
 
-        {/*
-         * Skip appears ONLY after the countdown finishes. Note: depending on the
-         * Adsterra video product, a skip option may not be offered at all — in
-         * that case this button would be removed and onComplete() called
-         * automatically when the ad unit signals completion.
-         */}
         <button
           type="button"
           className="btn-primary disabled:opacity-40"
@@ -154,4 +408,11 @@ export default function VideoAdModal({
       </div>
     </div>
   );
+}
+
+// Minimal ambient typing so TypeScript doesn't complain about window.google.
+declare global {
+  interface Window {
+    google?: { ima?: any };
+  }
 }
