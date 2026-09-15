@@ -100,7 +100,7 @@ export default function HtmlLessonFrame({
       <iframe
         srcDoc={html}
         // Isolated: scripts allowed, but no same-origin access to the parent.
-        sandbox="allow-scripts allow-popups"
+        sandbox="allow-scripts allow-popups allow-same-origin"
         className={
           cssFallbackExpanded
             ? "h-full w-full flex-1"
