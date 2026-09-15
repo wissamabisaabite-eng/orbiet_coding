@@ -103,6 +103,12 @@ export const metadata: Metadata = {
   },
   // Favicon/app icons are generated automatically by src/app/icon.tsx —
   // no static image files needed.
+
+  // HilltopAds site-ownership verification meta tag.
+  other: {
+    "4a1f0a310b3325127e20608f038a296958d3cde4":
+      "4a1f0a310b3325127e20608f038a296958d3cde4",
+  },
 };
 
 export default function RootLayout({
