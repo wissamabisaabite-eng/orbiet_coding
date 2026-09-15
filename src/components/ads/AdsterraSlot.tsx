@@ -46,7 +46,7 @@ export default function AdsterraSlot({
     params: {}
   };
 </script>
-<script src="https://www.highperformanceformat.com/${adKey}/invoke.js"></script>
+<script src="https://www.highrevenueformat.com/${adKey}/invoke.js"></script>
 </body></html>`;
 
   return (
