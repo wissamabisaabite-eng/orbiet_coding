@@ -3,7 +3,7 @@ import Logo from "@/components/Logo";
 import VisitorCounter from "@/components/VisitorCounter";
 
 // Legal/info pages linked from every page footer -- required for Adsterra /
-// HilltopAds site approval (About, Privacy, Terms, Contact must be reachable
+// ExoClick site approval (About, Privacy, Terms, Contact must be reachable
 // site-wide, not just from the homepage).
 const FOOTER_LINKS = [
   { href: "/about", label: "من نحن" },

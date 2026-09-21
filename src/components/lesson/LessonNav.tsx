@@ -4,14 +4,17 @@
  * Prev/Next navigation across the whole (flattened) course.
  *
  * "Next lesson" is gated by the video ad every LESSONS_BETWEEN_VIDEO_ADS
- * in-app transitions — counted PER MODULE (see VideoAdModal.tsx), so the
- * count restarts at 1 whenever the student enters a new module, instead of
- * accumulating across the whole course.
+ * in-app transitions — counted GLOBALLY across the whole course (lessons
+ * 4, 8, 12, 16...), using the 1-based position of the current lesson in the
+ * flattened, whole-course `flat` list (`index + 1`). This is derived purely
+ * from `flat`/`currentLessonId` on every render, so it's automatically
+ * correct regardless of how lessons are split across modules — no counter
+ * to keep in sync in storage.
  *
- * We do NOT navigate immediately. advanceAndShouldShowVideoAd() decides
- * (every Nth transition) whether to show the ad modal first; navigation
- * itself only happens once the modal calls onComplete (or immediately, if
- * this transition doesn't gate on an ad at all).
+ * We do NOT navigate immediately. shouldShowVideoAd() decides (every Nth
+ * global lesson) whether to show the ad modal first; navigation itself only
+ * happens once the modal calls onComplete (or immediately, if this
+ * transition doesn't gate on an ad at all).
  *
  * To avoid the ad ever starting audio/video while the student is still
  * reading, the ad is only ever *prefetched* (never played) as soon as this
@@ -24,10 +27,7 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import type { FlatLesson } from "@/types";
-import {
-  peekShouldShowVideoAd,
-  advanceAndShouldShowVideoAd,
-} from "@/components/ads/VideoAdModal";
+import { shouldShowVideoAd } from "@/components/ads/VideoAdModal";
 import { Isolate } from "@/components/Bidi";
 
 const VideoAdModal = dynamic(() => import("@/components/ads/VideoAdModal"), {
@@ -51,22 +51,24 @@ export default function LessonNav({
   const index = flat.findIndex((l) => l.id === currentLessonId);
   const prev = index > 0 ? flat[index - 1] : null;
   const next = index >= 0 && index < flat.length - 1 ? flat[index + 1] : null;
-  const currentModuleId = index >= 0 ? flat[index].moduleId : null;
+  // 1-based global lesson number across the whole (flattened) course.
+  const globalLessonIndex = index >= 0 ? index + 1 : null;
+  const gatesOnAd =
+    globalLessonIndex !== null && shouldShowVideoAd(globalLessonIndex);
 
   const hrefFor = (l: FlatLesson) => `/courses/${courseId}/lessons/${l.id}`;
 
   // Once this nav (= end of the lesson content) scrolls into view, arm the
-  // ad prefetch — but only if leaving the CURRENT lesson's module on this
-  // transition would actually show the gate. peekShouldShowVideoAd never
-  // mutates the counter, so it's safe to check repeatedly.
+  // ad prefetch — but only if this transition (leaving the current, Nth
+  // global lesson) should actually show the gate.
   useEffect(() => {
-    if (prefetchArmed || !currentModuleId || !next) return;
+    if (prefetchArmed || !gatesOnAd || !next) return;
     const el = navRef.current;
     if (!el) return;
 
     const observer = new IntersectionObserver(
       ([entry]) => {
-        if (entry.isIntersecting && peekShouldShowVideoAd(currentModuleId)) {
+        if (entry.isIntersecting) {
           setPrefetchArmed(true);
           observer.disconnect();
         }
@@ -75,7 +77,7 @@ export default function LessonNav({
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, [prefetchArmed, currentModuleId, next]);
+  }, [prefetchArmed, gatesOnAd, next]);
 
   const goNext = useCallback(() => {
     if (!next) return;
@@ -84,13 +86,13 @@ export default function LessonNav({
   }, [next, router, courseId]);
 
   const onNextClick = useCallback(() => {
-    if (!next || !currentModuleId) return;
-    if (advanceAndShouldShowVideoAd(currentModuleId)) {
+    if (!next) return;
+    if (gatesOnAd) {
       setAdOpen(true);
     } else {
       goNext();
     }
-  }, [next, currentModuleId, goNext]);
+  }, [next, gatesOnAd, goNext]);
 
   const onAdComplete = useCallback(() => {
     setAdOpen(false);

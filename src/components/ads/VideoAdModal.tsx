@@ -6,7 +6,7 @@
  * This component is mounted by <LessonNav> BEFORE the student ever clicks
  * "الدرس التالي" — as soon as the nav (= end of the lesson content) scrolls
  * into view AND the upcoming transition is one that should show the ad gate.
- * At that point it silently prefetches the HilltopAds VAST creative in the
+ * At that point it silently prefetches the ExoClick VAST creative in the
  * background (`mode="hidden"`): the ad request + IMA `init()` happen off
  * screen, but `adsManager.start()` is NEVER called during this phase, so
  * nothing plays and no audio is heard while the student is still reading.
@@ -16,11 +16,14 @@
  * gesture, so autoplay-with-sound is allowed):
  *   - if the ad finished prefetching and is still fresh (< MAX_PREFETCH_AGE_MS
  *     old) -> play it immediately, essentially with zero wait.
- *   - if it's stale -> discard it and request a fresh one under a short
- *     timeout.
- *   - if it's still loading -> wait up to OPEN_FALLBACK_TIMEOUT_MS.
- *   - if it ultimately fails/never arrives -> show the Adsterra fallback
- *     banner instead.
+ *   - if it's stale -> discard it and request a fresh one under the
+ *     OPEN_FALLBACK_TIMEOUT_MS window below.
+ *   - if it's still loading -> wait up to OPEN_FALLBACK_TIMEOUT_MS (20s max,
+ *     per spec) for the VAST creative to arrive and start playing.
+ *   - if it ultimately fails/never arrives within that window (network
+ *     error, ad blocker, no-fill, dead VAST tag, etc.) -> the attempt is
+ *     cancelled immediately and the Adsterra banner fallback is shown
+ *     instead.
  *
  * The <video>/ad-container DOM nodes are mounted exactly ONCE for the whole
  * lifetime of this component (never remounted between hidden <-> open), so
@@ -31,24 +34,26 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Ltr } from "@/components/Bidi";
 import AdsterraSlot from "./AdsterraSlot";
 
-// Ad gate fires every 4th in-app "Next lesson" transition.
+// Ad gate fires every 4th lesson, counted GLOBALLY across the whole course
+// (not per module) — i.e. on lessons 4, 8, 12, 16... regardless of how
+// modules are split up. The caller (<LessonNav>) computes the global lesson
+// index from the flattened, whole-course lesson list and passes the
+// resulting boolean in; this module has no state of its own to keep in sync.
 export const LESSONS_BETWEEN_VIDEO_ADS = 4;
 
-const COUNTDOWN_SECONDS = 10;
+/** globalLessonIndex is 1-based (lesson #1, #2, #3...). Stateless by design. */
+export function shouldShowVideoAd(globalLessonIndex: number): boolean {
+  return globalLessonIndex % LESSONS_BETWEEN_VIDEO_ADS === 0;
+}
 
-// sessionStorage key is per-module so the "every Nth transition" counter
-// resets at the start of every module instead of accumulating across the
-// whole course (a module with 11 lessons and the next module with 7 lessons
-// must each count 1,2,3,4,1,2,3,4... independently, starting from zero every
-// time the student enters a new module).
-const TRANSITION_KEY_PREFIX = "orbiet_lesson_transitions_";
+const COUNTDOWN_SECONDS = 20;
 
-// How long the OPEN modal will wait for the (already-prefetched) ad before
-// giving up and showing the Adsterra fallback banner. Short on purpose: by
-// the time the modal opens, the ad has usually had minutes to prepare in the
-// background, so if it's still not ready within this window it's very
-// unlikely to arrive soon (ad blocker, no-fill, dead VAST tag, etc.).
-const OPEN_FALLBACK_TIMEOUT_MS = 2500;
+// Hard max wait (per spec) from the moment the student clicks "Next" until
+// we give up on the VAST video ad and fall back to the Adsterra banner. If
+// the ad was already prefetched and is fresh, playback starts immediately
+// and this timer never matters; it only bounds the worst case (prefetch
+// never finished / went stale / network error / ad blocker).
+const OPEN_FALLBACK_TIMEOUT_MS = 20000; // 20 seconds
 
 // How long a prefetched-but-unused ad stays "fresh" before we discard it and
 // request a new one instead. Guards against the VAST response effectively
@@ -56,42 +61,18 @@ const OPEN_FALLBACK_TIMEOUT_MS = 2500;
 // reaching the end of the content and actually clicking "next".
 const MAX_PREFETCH_AGE_MS = 5 * 60 * 1000; // 5 minutes
 
-// Timeout (ms) IMA is given to fetch the VAST XML response itself. Raised
-// above the SDK default (5s) because this now normally happens silently in
-// the background while the student is still reading — there's no visible
-// wait to protect, so it's worth giving a slower ad-server response more
-// time to still result in a real ad instead of the banner.
-const VAST_LOAD_TIMEOUT_MS = 8000;
+// Timeout (ms) IMA is given to fetch the VAST XML response itself. Capped at
+// the same 20s hard limit as the open-modal fallback above, so a slow VAST
+// response can never keep the student waiting past the spec'd maximum.
+const VAST_LOAD_TIMEOUT_MS = 20000;
 
-const VAST_TAG_URL = process.env.NEXT_PUBLIC_HILLTOP_VAST_TAG_URL;
+// ExoClick VAST In-Stream Video tag. Can be overridden via env var without a
+// code change (e.g. to swap zones per environment); falls back to the zone
+// given at integration time.
+const VAST_TAG_URL =
+  process.env.NEXT_PUBLIC_EXOCLICK_VAST_TAG_URL ||
+  "https://s.magsrv.com/v1/vast.php?idz=6035560";
 const FALLBACK_AD_KEY = process.env.NEXT_PUBLIC_ADSTERRA_KEY_VIDEO;
-
-/**
- * Read (without advancing) whether the NEXT in-app transition for this
- * module would show the video ad gate. Used to decide whether it's worth
- * prefetching at all once the student reaches the end of a lesson's content.
- * Safe to call repeatedly (e.g. from an IntersectionObserver) since it never
- * mutates the counter.
- */
-export function peekShouldShowVideoAd(moduleId: string): boolean {
-  if (typeof window === "undefined") return false;
-  const prev = Number(sessionStorage.getItem(TRANSITION_KEY_PREFIX + moduleId) ?? "0");
-  return (prev + 1) % LESSONS_BETWEEN_VIDEO_ADS === 0;
-}
-
-/**
- * Advance the per-module transition counter and return whether the gate
- * should show for THIS transition. Only ever called from the actual in-app
- * "Next lesson" click (never on load, never from the peek above).
- */
-export function advanceAndShouldShowVideoAd(moduleId: string): boolean {
-  if (typeof window === "undefined") return false;
-  const key = TRANSITION_KEY_PREFIX + moduleId;
-  const prev = Number(sessionStorage.getItem(key) ?? "0");
-  const next = prev + 1;
-  sessionStorage.setItem(key, String(next));
-  return next % LESSONS_BETWEEN_VIDEO_ADS === 0;
-}
 
 // ---------------------------------------------------------------------------
 // Lazy IMA SDK script loader (module-level singleton promise so we only ever
