@@ -104,10 +104,11 @@ export const metadata: Metadata = {
   // Favicon/app icons are generated automatically by src/app/icon.tsx —
   // no static image files needed.
 
-  // HilltopAds site-ownership verification meta tag.
+  // Site-ownership verification meta tags for ad-network approval.
   other: {
-    "4a1f0a310b3325127e20608f038a296958d3cde4":
-      "4a1f0a310b3325127e20608f038a296958d3cde4",
+    
+    // ExoClick — <meta name="6a97888e-site-verification" content="...">
+    "6a97888e-site-verification": "e85c7f2f0a0d3e6ef48a84d08dd9c281",
   },
 };
 
