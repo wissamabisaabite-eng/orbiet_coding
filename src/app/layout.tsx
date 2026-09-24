@@ -107,8 +107,8 @@ export const metadata: Metadata = {
   // Site-ownership verification meta tags for ad-network approval.
   other: {
     
-    // ExoClick — <meta name="6a97888e-site-verification" content="...">
-    "6a97888e-site-verification": "e85c7f2f0a0d3e6ef48a84d08dd9c281",
+    // ClickAdu — <meta name="clckd" content="...">
+    clckd: "fa9fd940ebeee99ddc9326776952349a",
   },
 };
 
