@@ -107,8 +107,8 @@ export const metadata: Metadata = {
   // Site-ownership verification meta tags for ad-network approval.
   other: {
     
-    // ClickAdu — <meta name="clckd" content="...">
-    clckd: "fa9fd940ebeee99ddc9326776952349a",
+    // DaoAds — <meta name="daopush-site-verification" content="...">
+    "daopush-site-verification": "e5c759cceadbf82a99fab2056dc6efc7e9c5419c",
   },
 };
 
