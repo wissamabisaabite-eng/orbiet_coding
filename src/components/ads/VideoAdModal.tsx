@@ -6,7 +6,7 @@
  * This component is mounted by <LessonNav> BEFORE the student ever clicks
  * "الدرس التالي" — as soon as the nav (= end of the lesson content) scrolls
  * into view AND the upcoming transition is one that should show the ad gate.
- * At that point it silently prefetches the ExoClick VAST creative in the
+ * At that point it silently prefetches the DaoAds VAST creative in the
  * background (`mode="hidden"`): the ad request + IMA `init()` happen off
  * screen, but `adsManager.start()` is NEVER called during this phase, so
  * nothing plays and no audio is heard while the student is still reading.
@@ -16,63 +16,83 @@
  * gesture, so autoplay-with-sound is allowed):
  *   - if the ad finished prefetching and is still fresh (< MAX_PREFETCH_AGE_MS
  *     old) -> play it immediately, essentially with zero wait.
- *   - if it's stale -> discard it and request a fresh one under the
- *     OPEN_FALLBACK_TIMEOUT_MS window below.
- *   - if it's still loading -> wait up to OPEN_FALLBACK_TIMEOUT_MS (20s max,
- *     per spec) for the VAST creative to arrive and start playing.
- *   - if it ultimately fails/never arrives within that window (network
- *     error, ad blocker, no-fill, dead VAST tag, etc.) -> the attempt is
- *     cancelled immediately and the Adsterra banner fallback is shown
- *     instead.
+ *   - if it's stale -> discard it and request a fresh one under a short
+ *     timeout.
+ *   - if it's still loading -> wait up to OPEN_FALLBACK_TIMEOUT_MS.
+ *   - if it ultimately fails/never arrives -> show the Adsterra fallback
+ *     banner instead.
  *
  * The <video>/ad-container DOM nodes are mounted exactly ONCE for the whole
  * lifetime of this component (never remounted between hidden <-> open), so
  * IMA's attachment to them, and any audio it's already produced, is never
- * silently orphaned the way it was in the old implementation.
+ * silently orphaned.
+ *
+ * FULL-SCREEN SIZING: the ad is requested/initialized at real viewport
+ * dimensions from the very start (even while prefetching off-screen), not a
+ * small fixed placeholder box — some VAST creatives render at a fixed pixel
+ * size baked into the response and don't upscale cleanly later, which is
+ * what caused the "tiny box in the corner" look. The video element itself
+ * uses object-fit: cover so it always fills the full-screen container with
+ * no letterboxing, on any device.
+ *
+ * HARD STOP ON "Continue": clicking the continue button explicitly stops
+ * and destroys the ads manager and pauses/mutes the underlying <video>
+ * BEFORE calling onComplete, so no ad audio/video can keep running in the
+ * background after the student moves on to the next lesson.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Ltr } from "@/components/Bidi";
 import AdsterraSlot from "./AdsterraSlot";
 
-// Ad gate fires every 4th lesson, counted GLOBALLY across the whole course
-// (not per module) — i.e. on lessons 4, 8, 12, 16... regardless of how
-// modules are split up. The caller (<LessonNav>) computes the global lesson
-// index from the flattened, whole-course lesson list and passes the
-// resulting boolean in; this module has no state of its own to keep in sync.
+// Ad gate fires every 4th in-app "Next lesson" transition.
 export const LESSONS_BETWEEN_VIDEO_ADS = 4;
 
-/** globalLessonIndex is 1-based (lesson #1, #2, #3...). Stateless by design. */
-export function shouldShowVideoAd(globalLessonIndex: number): boolean {
-  return globalLessonIndex % LESSONS_BETWEEN_VIDEO_ADS === 0;
-}
+const COUNTDOWN_SECONDS = 10;
 
-const COUNTDOWN_SECONDS = 20;
+// A SINGLE global counter for the whole course/session -- NOT per-module.
+// The gate fires every 4th "Next lesson" click overall, continuing to count
+// across module boundaries instead of resetting back to 1 every time the
+// student enters a new module.
+const TRANSITION_KEY = "orbiet_lesson_transitions";
 
-// Hard max wait (per spec) from the moment the student clicks "Next" until
-// we give up on the VAST video ad and fall back to the Adsterra banner. If
-// the ad was already prefetched and is fresh, playback starts immediately
-// and this timer never matters; it only bounds the worst case (prefetch
-// never finished / went stale / network error / ad blocker).
-const OPEN_FALLBACK_TIMEOUT_MS = 20000; // 20 seconds
+// How long the OPEN modal will wait for the (already-prefetched) ad before
+// giving up and showing the Adsterra fallback banner.
+const OPEN_FALLBACK_TIMEOUT_MS = 20000;
 
 // How long a prefetched-but-unused ad stays "fresh" before we discard it and
-// request a new one instead. Guards against the VAST response effectively
-// going stale if the student lingers on the lesson for a long time between
-// reaching the end of the content and actually clicking "next".
+// request a new one instead.
 const MAX_PREFETCH_AGE_MS = 5 * 60 * 1000; // 5 minutes
 
-// Timeout (ms) IMA is given to fetch the VAST XML response itself. Capped at
-// the same 20s hard limit as the open-modal fallback above, so a slow VAST
-// response can never keep the student waiting past the spec'd maximum.
-const VAST_LOAD_TIMEOUT_MS = 20000;
+// Timeout (ms) IMA is given to fetch the VAST XML response itself.
+const VAST_LOAD_TIMEOUT_MS = 10000;
 
-// ExoClick VAST In-Stream Video tag. Can be overridden via env var without a
-// code change (e.g. to swap zones per environment); falls back to the zone
-// given at integration time.
-const VAST_TAG_URL =
-  process.env.NEXT_PUBLIC_EXOCLICK_VAST_TAG_URL ||
-  "https://s.magsrv.com/v1/vast.php?idz=6035560";
+const VAST_TAG_URL = process.env.NEXT_PUBLIC_DAOADS_VAST_TAG_URL;
 const FALLBACK_AD_KEY = process.env.NEXT_PUBLIC_ADSTERRA_KEY_VIDEO;
+
+/**
+ * Read (without advancing) whether the NEXT in-app transition would show the
+ * video ad gate. The moduleId argument is accepted for API compatibility
+ * with <LessonNav> but is no longer used for counting -- the counter is
+ * global/continuous across the whole course.
+ */
+export function peekShouldShowVideoAd(_moduleId: string): boolean {
+  if (typeof window === "undefined") return false;
+  const prev = Number(sessionStorage.getItem(TRANSITION_KEY) ?? "0");
+  return (prev + 1) % LESSONS_BETWEEN_VIDEO_ADS === 0;
+}
+
+/**
+ * Advance the global transition counter and return whether the gate should
+ * show for THIS transition. Only ever called from the actual in-app "Next
+ * lesson" click.
+ */
+export function advanceAndShouldShowVideoAd(_moduleId: string): boolean {
+  if (typeof window === "undefined") return false;
+  const prev = Number(sessionStorage.getItem(TRANSITION_KEY) ?? "0");
+  const next = prev + 1;
+  sessionStorage.setItem(TRANSITION_KEY, String(next));
+  return next % LESSONS_BETWEEN_VIDEO_ADS === 0;
+}
 
 // ---------------------------------------------------------------------------
 // Lazy IMA SDK script loader (module-level singleton promise so we only ever
@@ -111,12 +131,24 @@ function loadImaSdk(): Promise<void> {
   return imaSdkPromise;
 }
 
-// Off-screen box size used purely so IMA has real pixel dimensions to size
-// the prefetched creative against before the modal is ever visible. It gets
-// resized to the real, full-screen, per-device dimensions the moment the
-// modal actually opens (see the "mode becomes open" effect below).
-const PREFETCH_BOX_WIDTH = 480;
-const PREFETCH_BOX_HEIGHT = 270;
+// Fallback size only used in the rare case window is unavailable when we
+// need a number (SSR guard) -- in practice the real viewport size is always
+// used instead, see getFullScreenSize() below.
+const SIZE_FALLBACK_WIDTH = 1280;
+const SIZE_FALLBACK_HEIGHT = 720;
+
+/** Real, current full-screen size to request/init/size the ad at -- used
+ * even while prefetching off-screen, so the creative is never requested at
+ * a small placeholder size that some VAST responses can't upscale from. */
+function getFullScreenSize(): { width: number; height: number } {
+  if (typeof window === "undefined") {
+    return { width: SIZE_FALLBACK_WIDTH, height: SIZE_FALLBACK_HEIGHT };
+  }
+  return {
+    width: window.innerWidth || SIZE_FALLBACK_WIDTH,
+    height: window.innerHeight || SIZE_FALLBACK_HEIGHT,
+  };
+}
 
 type AdState =
   | "prefetching" // requestAds() in flight, creative not yet ready
@@ -151,12 +183,35 @@ export default function VideoAdModal({
 
   const teardownAdsManager = useCallback(() => {
     try {
+      adsManagerRef.current?.stop?.();
+    } catch {
+      // ignore
+    }
+    try {
       adsManagerRef.current?.destroy();
     } catch {
       // already torn down or never fully initialized — ignore
     }
     adsManagerRef.current = null;
   }, []);
+
+  // Fully stops any playing/loaded ad: destroys the ads manager AND
+  // explicitly pauses + mutes + resets the underlying <video> element, so no
+  // audio/video can keep running in the background under any circumstance.
+  const hardStopAd = useCallback(() => {
+    teardownAdsManager();
+    try {
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.muted = true;
+        videoRef.current.currentTime = 0;
+        videoRef.current.removeAttribute("src");
+        videoRef.current.load();
+      }
+    } catch {
+      // ignore
+    }
+  }, [teardownAdsManager]);
 
   const goToFallback = useCallback(() => {
     if (openFallbackTimerRef.current) {
@@ -213,10 +268,10 @@ export default function VideoAdModal({
             });
 
             try {
-              const rect = boxRef.current?.getBoundingClientRect();
-              const w = Math.round(rect?.width || PREFETCH_BOX_WIDTH);
-              const h = Math.round(rect?.height || PREFETCH_BOX_HEIGHT);
-              adsManager.init(w, h, ima.ViewMode.NORMAL);
+              // Init at real full-screen size from the start so the
+              // creative renders full-bleed instead of a small fixed box.
+              const { width, height } = getFullScreenSize();
+              adsManager.init(width, height, ima.ViewMode.NORMAL);
             } catch {
               goToFallback();
             }
@@ -230,9 +285,9 @@ export default function VideoAdModal({
         const adsRequest = new ima.AdsRequest();
         adsRequest.adTagUrl = VAST_TAG_URL;
         adsRequest.vastLoadTimeout = VAST_LOAD_TIMEOUT_MS;
-        const rect = boxRef.current?.getBoundingClientRect();
-        adsRequest.linearAdSlotWidth = Math.round(rect?.width || PREFETCH_BOX_WIDTH);
-        adsRequest.linearAdSlotHeight = Math.round(rect?.height || PREFETCH_BOX_HEIGHT);
+        const { width, height } = getFullScreenSize();
+        adsRequest.linearAdSlotWidth = width;
+        adsRequest.linearAdSlotHeight = height;
 
         adsLoader.requestAds(adsRequest);
       })
@@ -246,9 +301,7 @@ export default function VideoAdModal({
   const onCompleteRef = useRef(onComplete);
   onCompleteRef.current = onComplete;
 
-  // ---- Kick off prefetch once, on mount. This component only ever mounts
-  // when the parent (<LessonNav>) has already decided this transition is
-  // worth prefetching for. ----
+  // ---- Kick off prefetch once, on mount. ----
   useEffect(() => {
     cancelledRef.current = false;
     runPrefetchPipeline();
@@ -257,7 +310,7 @@ export default function VideoAdModal({
       cancelledRef.current = true;
       if (openFallbackTimerRef.current) clearTimeout(openFallbackTimerRef.current);
       openFallbackTimerRef.current = null;
-      teardownAdsManager();
+      hardStopAd();
       try {
         adsLoaderRef.current?.destroy();
       } catch {
@@ -268,16 +321,12 @@ export default function VideoAdModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const resizeToBox = useCallback(() => {
+  const resizeToFullScreen = useCallback(() => {
     const ima = window.google?.ima;
-    const rect = boxRef.current?.getBoundingClientRect();
-    if (!ima || !rect || !adsManagerRef.current) return;
+    if (!ima || !adsManagerRef.current) return;
+    const { width, height } = getFullScreenSize();
     try {
-      adsManagerRef.current.resize(
-        Math.round(rect.width),
-        Math.round(rect.height),
-        ima.ViewMode.NORMAL
-      );
+      adsManagerRef.current.resize(width, height, ima.ViewMode.NORMAL);
     } catch {
       // ad may already have ended — ignore
     }
@@ -289,13 +338,13 @@ export default function VideoAdModal({
       openFallbackTimerRef.current = null;
     }
     try {
-      resizeToBox();
+      resizeToFullScreen();
       adsManagerRef.current.start();
       setAdState("playing");
     } catch {
       goToFallback();
     }
-  }, [resizeToBox, goToFallback]);
+  }, [resizeToFullScreen, goToFallback]);
 
   // ---- React to the modal actually opening (student clicked "Next") ----
   useEffect(() => {
@@ -306,20 +355,16 @@ export default function VideoAdModal({
       readyAtRef.current !== null &&
       Date.now() - readyAtRef.current < MAX_PREFETCH_AGE_MS;
 
-    if (isFresh && window.google?.ima && adsManagerRef.current && boxRef.current) {
-      // Prefetched in time and still fresh — play immediately. This IS the
-      // direct response to the click, so autoplay-with-sound is allowed.
+    if (isFresh && window.google?.ima && adsManagerRef.current) {
       startPlayback();
       return;
     }
 
     if (adStateRef.current === "fallback") {
-      return; // already known unavailable — banner is already showing
+      return;
     }
 
     if (!isFresh && adStateRef.current === "ready") {
-      // Stale: throw away the old one and request a fresh one under the
-      // short timeout below, since the student is now actively waiting.
       teardownAdsManager();
       readyAtRef.current = null;
       cancelledRef.current = false;
@@ -336,18 +381,12 @@ export default function VideoAdModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
 
-  // If the ad finishes prefetching WHILE the modal is already open (it was
-  // still loading at click-time, and arrived within the short grace window)
-  // — start it immediately.
   useEffect(() => {
     if (mode !== "open" || adState !== "ready") return;
-    if (!window.google?.ima || !adsManagerRef.current || !boxRef.current) return;
+    if (!window.google?.ima || !adsManagerRef.current) return;
     startPlayback();
   }, [mode, adState, startPlayback]);
 
-  // ---- Countdown — only runs while the modal is actually open. The
-  // "continue" control stays disabled/hidden until it reaches zero, same as
-  // the skip-ad pattern used by video apps. ----
   useEffect(() => {
     if (mode !== "open") return;
     setRemaining(COUNTDOWN_SECONDS);
@@ -368,20 +407,22 @@ export default function VideoAdModal({
     };
   }, [mode]);
 
-  // ---- Keep the ad sized to the full screen across resizes/orientation
-  // changes (mobile rotation, browser chrome show/hide, etc.) while it's
-  // actively playing. ----
   useEffect(() => {
     if (mode !== "open" || adState !== "playing") return;
-    if (!boxRef.current) return;
-    const observer = new ResizeObserver(resizeToBox);
-    observer.observe(boxRef.current);
-    window.addEventListener("orientationchange", resizeToBox);
+    window.addEventListener("resize", resizeToFullScreen);
+    window.addEventListener("orientationchange", resizeToFullScreen);
     return () => {
-      observer.disconnect();
-      window.removeEventListener("orientationchange", resizeToBox);
+      window.removeEventListener("resize", resizeToFullScreen);
+      window.removeEventListener("orientationchange", resizeToFullScreen);
     };
-  }, [mode, adState, resizeToBox]);
+  }, [mode, adState, resizeToFullScreen]);
+
+  // Explicit "continue" handler: HARD-stops the ad BEFORE telling the
+  // parent to move on, so nothing can keep playing/making sound.
+  const handleContinue = useCallback(() => {
+    hardStopAd();
+    onComplete();
+  }, [hardStopAd, onComplete]);
 
   const countdownDone = remaining === 0;
   const isOpen = mode === "open";
@@ -393,24 +434,19 @@ export default function VideoAdModal({
           ? "fixed inset-0 z-50 flex flex-col bg-black"
           : "pointer-events-none fixed opacity-0"
       }
-      style={isOpen ? undefined : { top: -9999, left: -9999 }}
+      style={isOpen ? undefined : { top: -9999, left: -9999, width: 1, height: 1 }}
       role={isOpen ? "dialog" : undefined}
       aria-modal={isOpen ? true : undefined}
       aria-label={isOpen ? "إعلان قصير قبل الدرس التالي" : undefined}
       aria-hidden={isOpen ? undefined : true}
     >
-      {/* Fixed reserved box — the SAME <video>/adContainer nodes are used
-          whether we're silently prefetching off-screen (small, fixed size)
-          or actually showing the modal (full viewport on any device), so
-          IMA's attachment to them is never disturbed by a remount. Only
-          this box's own size/position (and the wrapper above) change. */}
       <div
         ref={boxRef}
         className={isOpen ? "relative w-full flex-1 overflow-hidden bg-black" : "relative overflow-hidden"}
-        style={isOpen ? undefined : { width: PREFETCH_BOX_WIDTH, height: PREFETCH_BOX_HEIGHT }}
+        style={isOpen ? undefined : { width: 1, height: 1 }}
       >
         <div className="absolute inset-0" style={{ opacity: adState === "playing" ? 1 : 0 }}>
-          <video ref={videoRef} className="h-full w-full object-contain" playsInline muted={false} />
+          <video ref={videoRef} className="h-full w-full object-cover" playsInline muted={false} />
           <div ref={adContainerRef} className="absolute inset-0" />
         </div>
 
@@ -434,9 +470,6 @@ export default function VideoAdModal({
           </div>
         )}
 
-        {/* Top overlay: small unobtrusive label + live countdown, like the
-            in-corner timers used by video apps. No close/skip control is
-            rendered here at all while the countdown is running. */}
         {isOpen && (
           <div className="pointer-events-none absolute inset-x-0 top-0 flex items-center justify-between bg-gradient-to-b from-black/70 to-transparent p-3 sm:p-4">
             <span className="rounded-full bg-black/50 px-3 py-1 text-xs text-white/90">إعلان</span>
@@ -448,13 +481,9 @@ export default function VideoAdModal({
           </div>
         )}
 
-        {/* Bottom overlay: the ONLY way to proceed. It stays out of the way
-            visually while the countdown runs and only becomes an actionable
-            button once it hits zero — same pattern as "skip ad" buttons in
-            every mainstream video app. */}
         {isOpen && countdownDone && (
           <div className="absolute inset-x-0 bottom-0 flex justify-center bg-gradient-to-t from-black/80 to-transparent p-4 sm:p-6">
-            <button type="button" className="btn-primary" onClick={onComplete}>
+            <button type="button" className="btn-primary" onClick={handleContinue}>
               المتابعة إلى الدرس
             </button>
           </div>
