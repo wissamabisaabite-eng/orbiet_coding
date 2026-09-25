@@ -49,12 +49,6 @@ export const LESSONS_BETWEEN_VIDEO_ADS = 4;
 
 const COUNTDOWN_SECONDS = 10;
 
-// A SINGLE global counter for the whole course/session -- NOT per-module.
-// The gate fires every 4th "Next lesson" click overall, continuing to count
-// across module boundaries instead of resetting back to 1 every time the
-// student enters a new module.
-const TRANSITION_KEY = "orbiet_lesson_transitions";
-
 // How long the OPEN modal will wait for the (already-prefetched) ad before
 // giving up and showing the Adsterra fallback banner.
 const OPEN_FALLBACK_TIMEOUT_MS = 20000;
@@ -69,29 +63,13 @@ const VAST_LOAD_TIMEOUT_MS = 10000;
 const VAST_TAG_URL = process.env.NEXT_PUBLIC_DAOADS_VAST_TAG_URL;
 const FALLBACK_AD_KEY = process.env.NEXT_PUBLIC_ADSTERRA_KEY_VIDEO;
 
-/**
- * Read (without advancing) whether the NEXT in-app transition would show the
- * video ad gate. The moduleId argument is accepted for API compatibility
- * with <LessonNav> but is no longer used for counting -- the counter is
- * global/continuous across the whole course.
- */
-export function peekShouldShowVideoAd(_moduleId: string): boolean {
-  if (typeof window === "undefined") return false;
-  const prev = Number(sessionStorage.getItem(TRANSITION_KEY) ?? "0");
-  return (prev + 1) % LESSONS_BETWEEN_VIDEO_ADS === 0;
-}
-
-/**
- * Advance the global transition counter and return whether the gate should
- * show for THIS transition. Only ever called from the actual in-app "Next
- * lesson" click.
- */
-export function advanceAndShouldShowVideoAd(_moduleId: string): boolean {
-  if (typeof window === "undefined") return false;
-  const prev = Number(sessionStorage.getItem(TRANSITION_KEY) ?? "0");
-  const next = prev + 1;
-  sessionStorage.setItem(TRANSITION_KEY, String(next));
-  return next % LESSONS_BETWEEN_VIDEO_ADS === 0;
+// Ad gate fires every 4th lesson, counted GLOBALLY and CONTINUOUSLY across
+// the whole (flattened) course -- not reset per module. <LessonNav> computes
+// the 1-based position of the current lesson in the whole-course flat list
+// and passes it in directly, so this is a pure function with no counter to
+// keep in sync in storage.
+export function shouldShowVideoAd(globalLessonIndex: number): boolean {
+  return globalLessonIndex % LESSONS_BETWEEN_VIDEO_ADS === 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +175,9 @@ export default function VideoAdModal({
 
   // Fully stops any playing/loaded ad: destroys the ads manager AND
   // explicitly pauses + mutes + resets the underlying <video> element, so no
-  // audio/video can keep running in the background under any circumstance.
+  // audio/video can keep running in the background under any circumstance
+  // (including edge cases where the ad SDK's own stop() doesn't immediately
+  // silence an in-flight audio track).
   const hardStopAd = useCallback(() => {
     teardownAdsManager();
     try {
@@ -268,8 +248,9 @@ export default function VideoAdModal({
             });
 
             try {
-              // Init at real full-screen size from the start so the
-              // creative renders full-bleed instead of a small fixed box.
+              // Init at real full-screen size from the start (see
+              // getFullScreenSize() note above) so the creative renders
+              // full-bleed instead of a small fixed box.
               const { width, height } = getFullScreenSize();
               adsManager.init(width, height, ima.ViewMode.NORMAL);
             } catch {
@@ -356,15 +337,18 @@ export default function VideoAdModal({
       Date.now() - readyAtRef.current < MAX_PREFETCH_AGE_MS;
 
     if (isFresh && window.google?.ima && adsManagerRef.current) {
+      // Prefetched in time and still fresh — play immediately.
       startPlayback();
       return;
     }
 
     if (adStateRef.current === "fallback") {
-      return;
+      return; // already known unavailable — banner is already showing
     }
 
     if (!isFresh && adStateRef.current === "ready") {
+      // Stale: throw away the old one and request a fresh one under the
+      // short timeout below, since the student is now actively waiting.
       teardownAdsManager();
       readyAtRef.current = null;
       cancelledRef.current = false;
@@ -381,12 +365,19 @@ export default function VideoAdModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
 
+  // If the ad finishes prefetching WHILE the modal is already open (it was
+  // still loading at click-time, and arrived within the grace window) —
+  // start it immediately.
   useEffect(() => {
     if (mode !== "open" || adState !== "ready") return;
     if (!window.google?.ima || !adsManagerRef.current) return;
     startPlayback();
   }, [mode, adState, startPlayback]);
 
+  // ---- Countdown — only runs while the modal is actually open. The
+  // "continue" control stays disabled/hidden until it reaches zero -- this
+  // is what delays the (custom, our own) skip/continue control, separate
+  // from any native skip button the ad creative itself might render. ----
   useEffect(() => {
     if (mode !== "open") return;
     setRemaining(COUNTDOWN_SECONDS);
@@ -407,6 +398,8 @@ export default function VideoAdModal({
     };
   }, [mode]);
 
+  // ---- Keep the ad sized to the full screen across resizes/orientation
+  // changes while it's actively playing. ----
   useEffect(() => {
     if (mode !== "open" || adState !== "playing") return;
     window.addEventListener("resize", resizeToFullScreen);
@@ -417,8 +410,9 @@ export default function VideoAdModal({
     };
   }, [mode, adState, resizeToFullScreen]);
 
-  // Explicit "continue" handler: HARD-stops the ad BEFORE telling the
-  // parent to move on, so nothing can keep playing/making sound.
+  // Explicit "continue" handler: HARD-stops the ad (destroys the ads
+  // manager, pauses/mutes/resets the <video>) BEFORE telling the parent to
+  // move on, so nothing can keep playing/making sound in the background.
   const handleContinue = useCallback(() => {
     hardStopAd();
     onComplete();
@@ -440,12 +434,18 @@ export default function VideoAdModal({
       aria-label={isOpen ? "إعلان قصير قبل الدرس التالي" : undefined}
       aria-hidden={isOpen ? undefined : true}
     >
+      {/* Fixed reserved box — the SAME <video>/adContainer nodes are used
+          whether we're silently prefetching off-screen or actually showing
+          the modal (full viewport on any device), so IMA's attachment to
+          them is never disturbed by a remount. */}
       <div
         ref={boxRef}
         className={isOpen ? "relative w-full flex-1 overflow-hidden bg-black" : "relative overflow-hidden"}
         style={isOpen ? undefined : { width: 1, height: 1 }}
       >
         <div className="absolute inset-0" style={{ opacity: adState === "playing" ? 1 : 0 }}>
+          {/* object-cover: the ad always fills the full-screen container
+              edge-to-edge with no letterboxing, on any device. */}
           <video ref={videoRef} className="h-full w-full object-cover" playsInline muted={false} />
           <div ref={adContainerRef} className="absolute inset-0" />
         </div>
@@ -470,6 +470,9 @@ export default function VideoAdModal({
           </div>
         )}
 
+        {/* Top overlay: small unobtrusive label + live countdown. No
+            close/skip control is rendered here at all while the countdown
+            is running. */}
         {isOpen && (
           <div className="pointer-events-none absolute inset-x-0 top-0 flex items-center justify-between bg-gradient-to-b from-black/70 to-transparent p-3 sm:p-4">
             <span className="rounded-full bg-black/50 px-3 py-1 text-xs text-white/90">إعلان</span>
@@ -481,6 +484,10 @@ export default function VideoAdModal({
           </div>
         )}
 
+        {/* Bottom overlay: the ONLY way to proceed. It stays out of the way
+            visually while the countdown runs and only becomes an actionable
+            button once it hits zero. Clicking it hard-stops the ad (no
+            lingering audio) before moving to the next lesson. */}
         {isOpen && countdownDone && (
           <div className="absolute inset-x-0 bottom-0 flex justify-center bg-gradient-to-t from-black/80 to-transparent p-4 sm:p-6">
             <button type="button" className="btn-primary" onClick={handleContinue}>
